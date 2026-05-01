@@ -1,0 +1,8 @@
+name: wmon
+version: 1.0.0
+description: WiFi monitor mode and 802.11 frame parsing
+author: Viggo Lekdorf
+license: MIT
+main: main.praia
+dependencies:
+  pcap: github.com/viggou/praia-pcap

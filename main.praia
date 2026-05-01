@@ -1,0 +1,205 @@
+// wmon — WiFi monitor mode for Praia
+//
+// Enable monitor mode on Linux, capture and parse 802.11 frames.
+// Requires root. Uses iw/ip for interface management, pcap for capture.
+//
+// Usage:
+//   use "wmon"
+//   use "pcap"
+//
+//   let mon = wmon.enable("wlan0")
+//   let cap = pcap.openLive(mon)
+//
+//   let pkt = pcap.next(cap)
+//   if (pkt) {
+//       let rt = wmon.parseRadiotap(pkt.data)
+//       let frame = wmon.parse80211(pkt.data, rt.headerLen)
+//       print(frame.typeStr, frame.ssid, "signal:", rt.signal)
+//   }
+//
+//   pcap.close(cap)
+//   wmon.disable(mon)
+
+let ext = ".dylib"
+if (sys.platform != "darwin") {
+    let arch = sys.exec(["uname", "-m"]).stdout.strip()
+    ext = "-linux-" + arch + ".so"
+}
+
+let _native = loadNative(path.dirname(sys.currentFile()) + "/plugins/wmon" + ext)
+
+// ── Native parsing functions ──
+
+let parseRadiotap = _native.parseRadiotap
+let parse80211 = _native.parse80211
+
+// ── Interface management (Linux, requires root) ──
+
+// True if NetworkManager is installed and currently managing `iface`.
+// On systems without nmcli (or where NM isn't running) we leave things
+// alone — there's no NM to interfere with monitor mode.
+func _nmIsManaging(iface) {
+    let r = sys.exec(["nmcli", "-t", "-f", "DEVICE,STATE", "device"])
+    if (r.exitCode != 0) { return false }
+    for (line in r.stdout.split("\n")) {
+        let parts = line.split(":")
+        if (len(parts) >= 2 && parts[0] == iface) {
+            return parts[1] != "unmanaged"
+        }
+    }
+    return false
+}
+
+// Per-monitor session state, set by enable() and consumed by disable().
+// Maps monName -> {origIface, nmTouched}.
+let _sessions = {}
+
+// Create a monitor mode interface. Returns the monitor interface name.
+// If NetworkManager is managing the radio it gets set to unmanaged for
+// the duration — without this NM periodically re-scans/re-MACs the
+// device and stalls frame delivery to the monitor interface.
+func enable(iface, monName) {
+    monName = monName ?? iface + "mon"
+
+    if (sys.platform == "darwin") {
+        throw "wmon.enable(): monitor mode requires Linux (macOS lacks public API)"
+    }
+
+    let nmTouched = false
+    if (_nmIsManaging(iface)) {
+        sys.exec(["nmcli", "device", "set", iface, "managed", "no"])
+        nmTouched = true
+    }
+
+    // Remove existing monitor interface if present
+    sys.exec(["ip", "link", "set", monName, "down"])
+    sys.exec(["iw", "dev", monName, "del"])
+
+    // Bring down the original interface
+    let r = sys.exec(["ip", "link", "set", iface, "down"])
+    if (r.exitCode != 0) {
+        if (nmTouched) { sys.exec(["nmcli", "device", "set", iface, "managed", "yes"]) }
+        throw "wmon.enable(): failed to bring down " + iface + " (need root?)"
+    }
+
+    // Create monitor interface
+    r = sys.exec(["iw", "dev", iface, "interface", "add", monName, "type", "monitor"])
+    if (r.exitCode != 0) {
+        sys.exec(["ip", "link", "set", iface, "up"])
+        if (nmTouched) { sys.exec(["nmcli", "device", "set", iface, "managed", "yes"]) }
+        throw "wmon.enable(): failed to create monitor interface: " + r.stderr.strip()
+    }
+
+    // Bring up monitor interface
+    r = sys.exec(["ip", "link", "set", monName, "up"])
+    if (r.exitCode != 0) {
+        sys.exec(["iw", "dev", monName, "del"])
+        sys.exec(["ip", "link", "set", iface, "up"])
+        if (nmTouched) { sys.exec(["nmcli", "device", "set", iface, "managed", "yes"]) }
+        throw "wmon.enable(): failed to bring up " + monName
+    }
+
+    _sessions[monName] = {origIface: iface, nmTouched: nmTouched}
+    return monName
+}
+
+// Remove a monitor interface and restore the original.
+func disable(monName) {
+    if (sys.platform == "darwin") { return }
+
+    let sess = _sessions[monName]
+    let origIface
+    if (sess) {
+        origIface = sess.origIface
+    } else {
+        // Best-effort fallback for monitors not created via enable():
+        // strip a trailing "mon" suffix.
+        origIface = monName
+        if (monName.endsWith("mon")) {
+            origIface = monName.slice(0, len(monName) - 3)
+        }
+    }
+
+    sys.exec(["ip", "link", "set", monName, "down"])
+    sys.exec(["iw", "dev", monName, "del"])
+    sys.exec(["ip", "link", "set", origIface, "up"])
+
+    if (sess?.nmTouched) {
+        sys.exec(["nmcli", "device", "set", origIface, "managed", "yes"])
+    }
+    _sessions.delete(monName)
+}
+
+// Set the channel on a monitor interface.
+func setChannel(iface, channel) {
+    let r = sys.exec(["iw", "dev", iface, "set", "channel", str(channel)])
+    if (r.exitCode != 0) {
+        throw "wmon.setChannel(): " + r.stderr.strip()
+    }
+}
+
+// ── High-level scan ──
+// Hops through channels and collects beacons/probe responses.
+// Returns an array of {ssid, bssid, channel, signal, encryption}.
+//
+// opts:
+//   channels: array of channel numbers (default: [1..13])
+//   dwell:    time per channel in ms (default: 300)
+//   onAP:     optional callback invoked once per newly-seen AP
+//   pcap:     pcap module reference (required)
+
+func scan(iface, opts) {
+    let pcapMod = opts?.pcap
+    if (!pcapMod) { throw "wmon.scan() requires opts.pcap (pass the pcap module)" }
+
+    let channels = opts?.channels ?? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    let dwellMs = opts?.dwell ?? 300
+    let onAP = opts?.onAP
+
+    let mon = enable(iface)
+    defer disable(mon)
+
+    let cap = pcapMod.openLive(mon, 65535, true, 100)
+    defer pcapMod.close(cap)
+
+    let seen = {}
+
+    for (ch in channels) {
+        try { setChannel(mon, ch) } catch (e) { continue }
+
+        let start = time.now()
+        while (time.now() - start < dwellMs) {
+            let pkt = pcapMod.next(cap)
+            if (!pkt) { continue }
+
+            let rt = parseRadiotap(pkt.data)
+            if (!rt) { continue }
+
+            let frame = parse80211(pkt.data, rt.headerLen)
+            if (!frame) { continue }
+
+            if (frame.typeStr != "beacon" && frame.typeStr != "probe-resp") { continue }
+
+            let bssid = frame.addr3 ?? frame.addr2 ?? ""
+            if (bssid == "" || seen.has(bssid)) { continue }
+
+            let ap = {
+                ssid: frame.ssid ?? "",
+                bssid: bssid,
+                channel: frame.channel ?? rt.channel,
+                signal: rt.signal,
+                encryption: frame.encryption ?? "unknown"
+            }
+            seen[bssid] = ap
+            if (onAP) { onAP(ap) }
+        }
+    }
+
+    return values(seen)
+}
+
+export {
+    parseRadiotap, parse80211,
+    enable, disable, setChannel,
+    scan
+}

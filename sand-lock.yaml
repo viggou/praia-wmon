@@ -1,0 +1,6 @@
+grains:
+  pcap:
+    source: github.com/viggou/praia-pcap
+    version: latest
+    url: https://github.com/viggou/praia-pcap.git
+    installed: 2026-05-01
